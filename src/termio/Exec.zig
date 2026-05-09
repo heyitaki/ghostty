@@ -1116,8 +1116,17 @@ const Subprocess = struct {
         grid_size: renderer.GridSize,
         screen_size: renderer.ScreenSize,
     ) !void {
+        // cmux fork: skip TIOCSWINSZ when the cell grid is unchanged. The
+        // kernel raises SIGWINCH on every TIOCSWINSZ regardless of whether
+        // rows/cols changed, which causes shells like starship to redraw
+        // their prompt on every change. The IO-thread debounce in
+        // Thread.zig keeps SIGWINCH off the hot path during a live drag;
+        // this guard catches no-op calls when only padding/pixel size
+        // changed without crossing a cell boundary.
+        const grid_changed = !self.grid_size.equals(grid_size);
         self.grid_size = grid_size;
         self.screen_size = screen_size;
+        if (!grid_changed) return;
 
         if (self.pty) |*pty| {
             // It is theoretically possible for the grid or screen size to

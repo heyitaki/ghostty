@@ -7,6 +7,7 @@ const std = @import("std");
 const Step = std.Build.Step;
 const RunStep = std.Build.Step.Run;
 const LazyPath = std.Build.LazyPath;
+const xcode = @import("xcode.zig");
 
 pub const Options = struct {
     /// The name of the xcframework to create.
@@ -49,6 +50,11 @@ pub fn create(b: *std.Build, opts: Options) *XCFrameworkStep {
     const run_create = run: {
         const run = RunStep.create(b, b.fmt("xcframework {s}", .{opts.name}));
         run.has_side_effects = true;
+        // cmux fork: see build/xcode.zig for the per-step DEVELOPER_DIR rationale.
+        run.setEnvironmentVariable(
+            "DEVELOPER_DIR",
+            xcode.developerDir(b),
+        );
         run.addArgs(&.{ "xcodebuild", "-create-xcframework" });
         for (opts.libraries) |lib| {
             run.addArg("-library");

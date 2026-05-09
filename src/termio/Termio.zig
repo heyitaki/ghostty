@@ -436,8 +436,17 @@ fn queueMessageManual(self: *Termio, msg: termio.Message) void {
             };
         },
         .inspector => {},
-        .resize => |v| self.resize(&td, v) catch |err| {
-            log.warn("manual inline resize failed err={}", .{err});
+        .resize => |v| {
+            // cmux fork: after the visual/pty split, the manual inline
+            // path must invoke both halves so backend.resize still runs.
+            // The IO-thread path debounces resizePty separately; the
+            // manual backend has no thread, so we fire it inline.
+            self.resize(&td, v) catch |err| {
+                log.warn("manual inline resize failed err={}", .{err});
+            };
+            self.resizePty(v) catch |err| {
+                log.warn("manual inline resizePty failed err={}", .{err});
+            };
         },
         .size_report => |v| self.sizeReport(&td, v) catch |err| {
             log.warn("manual inline size_report failed err={}", .{err});
@@ -553,16 +562,26 @@ pub fn resize(
     td: *ThreadData,
     size: renderer.Size,
 ) !void {
+    // cmux fork: pty (TIOCSWINSZ → SIGWINCH) is decoupled into
+    // `resizePty` on a longer debounce timer, so interactive drags
+    // reflow the visible grid every frame without firing SIGWINCH every
+    // frame (which causes starship/zsh prompt redraw flicker).
     self.size = size;
     const grid_size = size.grid();
-
-    // Update the size of our pty.
-    try self.backend.resize(grid_size, size.terminal());
 
     // Enter the critical area that we want to keep small
     {
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
+
+        // cmux fork: suppress Terminal.resize's prompt-cell clear. The
+        // clear assumes SIGWINCH fires immediately so the shell will
+        // redraw, but we debounce SIGWINCH — without this override the
+        // cells would stay blank for the duration of the drag. The
+        // shell's debounced redraw overwrites the reflowed cells.
+        const prev_prompt_redraw = self.terminal.flags.shell_redraws_prompt;
+        self.terminal.flags.shell_redraws_prompt = .false;
+        defer self.terminal.flags.shell_redraws_prompt = prev_prompt_redraw;
 
         // Update the size of our terminal state
         try self.terminal.resize(
@@ -588,6 +607,21 @@ pub fn resize(
     // Mail the renderer so that it can update the GPU and re-render
     _ = self.renderer_mailbox.push(.{ .resize = size }, .{ .forever = {} });
     self.renderer_wakeup.notify() catch {};
+}
+
+/// cmux fork: pty-only portion of a resize, fired from the IO thread
+/// after the pty-debounce timer settles. Sends TIOCSWINSZ which raises
+/// SIGWINCH in the child shell. Public because the IO thread callback
+/// (`Thread.ptyCoalesceCallback`) and the manual-backend inline path
+/// (`queueMessageManual`) need to invoke it directly outside the
+/// regular mailbox flow — the mailbox already routes `.resize`
+/// messages, and re-routing the post-debounce fire through it would
+/// reintroduce the per-frame SIGWINCH this split was designed to avoid.
+pub fn resizePty(
+    self: *Termio,
+    size: renderer.Size,
+) !void {
+    try self.backend.resize(size.grid(), size.terminal());
 }
 
 /// Make a size report.

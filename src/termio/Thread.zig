@@ -32,6 +32,29 @@ const Coalesce = struct {
     resize: ?renderer.Size = null,
 };
 
+/// cmux fork: pty-resize debounce. The visible grid reflows on the
+/// fast `Coalesce` timer above, but TIOCSWINSZ (which raises SIGWINCH
+/// in the child shell) is held back until the user pauses the drag.
+/// This keeps the starship/zsh prompt from re-rendering on every
+/// frame of an interactive resize.
+const PtyCoalesce = struct {
+    /// Milliseconds of quiet to wait before firing TIOCSWINSZ. Must be
+    /// long enough that an interactive drag won't keep clearing it,
+    /// but short enough that the shell catches up promptly when the
+    /// user lets go.
+    const min_ms = 150;
+
+    /// Backoff between retries after a transient backend.resize failure.
+    const retry_ms = 500;
+
+    /// Cap on retries so a permanently-broken pty (e.g. child exited)
+    /// doesn't busy-loop the IO thread re-arming a doomed timer.
+    const max_retries = 3;
+
+    resize: ?renderer.Size = null,
+    retry_count: u8 = 0,
+};
+
 /// The number of milliseconds before we reset the synchronized output flag
 /// if the running program hasn't already.
 const sync_reset_ms = 1000;
@@ -65,6 +88,13 @@ coalesce: xev.Timer,
 coalesce_c: xev.Completion = .{},
 coalesce_cancel_c: xev.Completion = .{},
 coalesce_data: Coalesce = .{},
+
+/// cmux fork: dedicated debounce timer for the pty (SIGWINCH) leg of
+/// a resize, separate from the visual coalesce timer above.
+pty_coalesce: xev.Timer,
+pty_coalesce_c: xev.Completion = .{},
+pty_coalesce_cancel_c: xev.Completion = .{},
+pty_coalesce_data: PtyCoalesce = .{},
 
 /// This timer is used to reset synchronized output modes so that
 /// the terminal doesn't freeze with a bad actor.
@@ -107,6 +137,10 @@ pub fn init(
     var coalesce_h = try xev.Timer.init();
     errdefer coalesce_h.deinit();
 
+    // cmux fork: dedicated debounce timer for the pty leg of a resize.
+    var pty_coalesce_h = try xev.Timer.init();
+    errdefer pty_coalesce_h.deinit();
+
     // This timer is used to reset synchronized output modes.
     var sync_reset_h = try xev.Timer.init();
     errdefer sync_reset_h.deinit();
@@ -117,6 +151,7 @@ pub fn init(
         .stop = stop_h,
         .scroll = scroll_h,
         .coalesce = coalesce_h,
+        .pty_coalesce = pty_coalesce_h,
         .sync_reset = sync_reset_h,
     };
 }
@@ -126,6 +161,7 @@ pub fn init(
 pub fn deinit(self: *Thread) void {
     self.scroll.deinit();
     self.coalesce.deinit();
+    self.pty_coalesce.deinit();
     self.sync_reset.deinit();
     self.stop.deinit();
     self.loop.deinit();
@@ -376,20 +412,50 @@ fn startSynchronizedOutput(self: *Thread, cb: *CallbackData) void {
 fn handleResize(self: *Thread, cb: *CallbackData, resize: renderer.Size) void {
     self.coalesce_data.resize = resize;
 
-    // If the timer is already active we just return. In the future we want
-    // to reset the timer up to a maximum wait time but for now this ensures
-    // relatively smooth resizing.
-    if (self.coalesce_c.state() == .active) return;
+    // cmux fork: skip pty timer churn if only sub-cell metrics changed
+    // (cell padding tweaks, mouse jitter that doesn't cross a cell
+    // boundary). The shell only cares about `cols × rows`, and
+    // re-arming the debounce every frame on identical-grid events
+    // would defeat its purpose if such events arrive in a tight loop.
+    const new_grid = resize.grid();
+    const grid_changed = if (self.pty_coalesce_data.resize) |prev| blk: {
+        const prev_grid = prev.grid();
+        break :blk prev_grid.columns != new_grid.columns or prev_grid.rows != new_grid.rows;
+    } else true;
 
-    self.coalesce.reset(
-        &self.loop,
-        &self.coalesce_c,
-        &self.coalesce_cancel_c,
-        Coalesce.min_ms,
-        CallbackData,
-        cb,
-        coalesceCallback,
-    );
+    if (grid_changed) {
+        self.pty_coalesce_data.resize = resize;
+        self.pty_coalesce_data.retry_count = 0;
+
+        // pty coalesce: debounce. Reset on every grid-changing event so
+        // continuous drags keep deferring the SIGWINCH; only fires
+        // after the user has paused for `PtyCoalesce.min_ms`.
+        self.pty_coalesce.reset(
+            &self.loop,
+            &self.pty_coalesce_c,
+            &self.pty_coalesce_cancel_c,
+            PtyCoalesce.min_ms,
+            CallbackData,
+            cb,
+            ptyCoalesceCallback,
+        );
+    }
+
+    // Visual coalesce: throttle. Fires `Coalesce.min_ms` after the first
+    // event in a burst so the on-screen grid reflows promptly during a
+    // continuous drag. Don't reset if already active — that would starve
+    // the visual update.
+    if (self.coalesce_c.state() != .active) {
+        self.coalesce.reset(
+            &self.loop,
+            &self.coalesce_c,
+            &self.coalesce_cancel_c,
+            Coalesce.min_ms,
+            CallbackData,
+            cb,
+            coalesceCallback,
+        );
+    }
 }
 
 fn syncResetCallback(
@@ -432,6 +498,60 @@ fn coalesceCallback(
         cb.io.resize(&cb.data, v) catch |err| {
             log.warn("error during resize err={}", .{err});
         };
+    }
+
+    return .disarm;
+}
+
+/// cmux fork: debounces TIOCSWINSZ so the child shell sees a single
+/// SIGWINCH per drag instead of one per frame.
+fn ptyCoalesceCallback(
+    cb_: ?*CallbackData,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    r: xev.Timer.RunError!void,
+) xev.CallbackAction {
+    _ = r catch |err| switch (err) {
+        error.Canceled => {},
+        else => {
+            log.warn("error during pty coalesce callback err={}", .{err});
+            return .disarm;
+        },
+    };
+
+    const cb = cb_ orelse return .disarm;
+
+    if (cb.self.pty_coalesce_data.resize) |v| {
+        cb.io.resizePty(v) catch |err| {
+            // cmux fork: retry transient TIOCSWINSZ failures (EINTR,
+            // fd contention); cap to avoid busy-loop on broken pty.
+            if (cb.self.pty_coalesce_data.retry_count < PtyCoalesce.max_retries) {
+                cb.self.pty_coalesce_data.retry_count += 1;
+                log.warn(
+                    "error during pty resize err={}, retry {d}/{d}",
+                    .{ err, cb.self.pty_coalesce_data.retry_count, PtyCoalesce.max_retries },
+                );
+                cb.self.pty_coalesce.reset(
+                    &cb.self.loop,
+                    &cb.self.pty_coalesce_c,
+                    &cb.self.pty_coalesce_cancel_c,
+                    PtyCoalesce.retry_ms,
+                    CallbackData,
+                    cb,
+                    ptyCoalesceCallback,
+                );
+            } else {
+                log.warn(
+                    "error during pty resize err={}, giving up after {d} retries",
+                    .{ err, PtyCoalesce.max_retries },
+                );
+                cb.self.pty_coalesce_data.resize = null;
+                cb.self.pty_coalesce_data.retry_count = 0;
+            }
+            return .disarm;
+        };
+        cb.self.pty_coalesce_data.resize = null;
+        cb.self.pty_coalesce_data.retry_count = 0;
     }
 
     return .disarm;

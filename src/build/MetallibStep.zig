@@ -6,6 +6,7 @@ const std = @import("std");
 const Step = std.Build.Step;
 const RunStep = std.Build.Step.Run;
 const LazyPath = std.Build.LazyPath;
+const xcode = @import("xcode.zig");
 
 pub const Options = struct {
     /// The name of the xcframework to create.
@@ -51,10 +52,14 @@ pub fn create(b: *std.Build, opts: Options) ?*MetallibStep {
         else => unreachable,
     };
 
+    // cmux fork: see build/xcode.zig for the per-step DEVELOPER_DIR rationale.
+    const xcode_dev_dir = xcode.developerDir(b);
+
     const run_ir = RunStep.create(
         b,
         b.fmt("metal {s}", .{opts.name}),
     );
+    run_ir.setEnvironmentVariable("DEVELOPER_DIR", xcode_dev_dir);
     run_ir.addArgs(&.{ "/usr/bin/xcrun", "-sdk", sdk, "metal", "-o" });
     const output_ir = run_ir.addOutputFileArg(b.fmt("{s}.ir", .{opts.name}));
     run_ir.addArgs(&.{"-c"});
@@ -70,6 +75,7 @@ pub fn create(b: *std.Build, opts: Options) ?*MetallibStep {
         b,
         b.fmt("metallib {s}", .{opts.name}),
     );
+    run_lib.setEnvironmentVariable("DEVELOPER_DIR", xcode_dev_dir);
     run_lib.addArgs(&.{ "/usr/bin/xcrun", "-sdk", sdk, "metallib", "-o" });
     const output_lib = run_lib.addOutputFileArg(b.fmt("{s}.metallib", .{opts.name}));
     run_lib.addFileArg(output_ir);
