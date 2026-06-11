@@ -258,6 +258,25 @@ const Mouse = struct {
     /// True if the mouse position is currently over a link.
     over_link: bool = false,
 
+    /// True while a left-button click that activates a link (the ctrl/super
+    /// link chord was held at press time) is in flight, i.e. between that
+    /// press and its release. While set, the press, any drag motion, and the
+    /// release are all suppressed from mouse reporting so the click is handled
+    /// locally as a link activation. We decide this once at press and hold it
+    /// through release — rather than re-checking the live modifiers each event
+    /// — so releasing the modifier (or drifting off the link cell) mid-click
+    /// can't leak a half-click (press/release/motion) to a mouse-grabbing
+    /// program. See `mouseButtonCallback` / `cursorPosCallback`.
+    link_click_active: bool = false,
+
+    /// Whether the cursor was over a link when a latched link click
+    /// (`link_click_active`) began. Captured at left-button press. The latched
+    /// release only opens a link when this is true, so a ctrl/super drag that
+    /// *starts off* a link and happens to release over one does not open the
+    /// release-time link (its press is still suppressed). A click that starts
+    /// on a link opens whatever link is under the release cursor.
+    link_press_over_link: bool = false,
+
     /// The last x/y in the cursor position for links. We use this to
     /// only process link hover events when the mouse actually moves cells.
     link_point: ?terminal.point.Coordinate = null,
@@ -1156,17 +1175,14 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
 
         .tmux_control => |v| {
             defer v.data.deinit();
-            _ = self.rt_app.performAction(
-                .{ .surface = self },
-                .tmux_control,
-                .{
-                    .event = v.event,
-                    .id = v.id,
-                    .data = v.data.slice(),
-                },
-            ) catch |err| {
-                log.warn("apprt failed to report tmux control event err={}", .{err});
-            };
+            if (comptime @hasDecl(apprt.runtime.Surface, "tmuxControl")) {
+                self.rt_surface.tmuxControl(v.event, v.id, v.data.slice());
+            } else {
+                log.debug(
+                    "apprt ignored tmux control event={s} id={} data_len={}",
+                    .{ @tagName(v.event), v.id, v.data.slice().len },
+                );
+            }
         },
 
         .selection_scroll_tick => |active| {
@@ -2860,13 +2876,11 @@ pub fn keyCallback(
         // Update our modifiers, this will update mouse mods too
         self.modsChanged(event.mods);
 
-        // We only refresh links if
-        // 1. mouse reporting is off
-        // OR
-        // 2. mouse reporting is on and we are not reporting shift to the terminal
-        if (self.io.terminal.flags.mouse_event == .none or
-            (self.mouse.mods.shift and !self.mouseShiftCapture(false)))
-        {
+        // We refresh links when local link handling is allowed for the
+        // current mouse-reporting state and mods (see mouseLinkRefreshAllowed):
+        // mouse reporting off, shift releasing capture, or the ctrl/super link
+        // modifier held so Cmd-click opens links inside a mouse-grabbing TUI.
+        if (self.mouseLinkRefreshAllowed()) {
             // Refresh our link state
             const pos = self.rt_surface.getCursorPos() catch break :mouse_mods;
             self.renderer_state.mutex.lock();
@@ -3910,6 +3924,35 @@ fn mouseShiftCapture(self: *const Surface, lock: bool) bool {
     };
 }
 
+/// Returns true if link hover/highlight state should be evaluated locally
+/// instead of handing the mouse event to the running program.
+///
+/// We always evaluate links when mouse reporting is off. When a program has
+/// mouse reporting enabled we still evaluate them if the user is holding
+/// shift to release the mouse from capture, or is holding the ctrl/super
+/// link-activation modifier. The latter lets Cmd-click (macOS) or Ctrl-click
+/// open a link even while a fullscreen/alternate-screen TUI has grabbed the
+/// mouse, matching iTerm2 and macOS Terminal.
+fn mouseLinkRefreshAllowed(self: *const Surface) bool {
+    return mouseLinkRefreshAllowedState(
+        self.isMouseReporting(),
+        self.mouseShiftCapture(false),
+        self.mouse.mods,
+    );
+}
+
+/// Pure decision logic for `mouseLinkRefreshAllowed`, split out so it can be
+/// unit tested without constructing a `Surface`.
+fn mouseLinkRefreshAllowedState(
+    mouse_reporting: bool,
+    shift_capture: bool,
+    mods: input.Mods,
+) bool {
+    if (!mouse_reporting) return true;
+    if (mods.shift and !shift_capture) return true;
+    return mods.equal(input.ctrlOrSuper(.{}));
+}
+
 /// Returns true if the mouse is currently captured by the terminal
 /// (i.e. reporting events).
 pub fn mouseCaptured(self: *Surface) bool {
@@ -3952,6 +3995,24 @@ pub fn mouseButtonCallback(
     // locking/unlocking but clicking isn't that frequent enough to be a
     // bottleneck.
     const shift_capture = self.mouseShiftCapture(true);
+
+    // Decide once, at left-button press, whether this click activates a link
+    // via the ctrl/super chord and so must be kept off the mouse-reporting
+    // path for its whole lifecycle. We latch the decision here (rather than
+    // re-checking live modifiers in each report path) so that releasing the
+    // modifier before the mouse button can't leak the release as a half-click.
+    if (button == .left and action == .press) {
+        self.mouse.link_click_active = self.mouse.mods.equal(input.ctrlOrSuper(.{}));
+        self.mouse.link_press_over_link = self.mouse.over_link;
+    }
+
+    // Clear the latch on every left-button release, on all return paths — the
+    // link-open and prompt-click branches below return early, so a plain
+    // statement after them would be skipped and leave the latch stale. The
+    // press above is the only setter; this defer is the only reset.
+    defer if (button == .left and action == .release) {
+        self.mouse.link_click_active = false;
+    };
 
     // Shift-click continues the previous mouse state if we have a selection.
     // cursorPosCallback will also do a mouse report so we don't need to do any
@@ -4020,8 +4081,19 @@ pub fn mouseButtonCallback(
 
         // Handle link clicking. We want to do this before we do mouse
         // reporting or any other mouse handling because a successfully
-        // clicked link will swallow the event.
-        if (self.mouse.over_link) {
+        // clicked link will swallow the event. We also attempt this when a
+        // link click is latched (link_click_active) even if over_link was
+        // cleared between press and release (e.g. the modifier was released or
+        // the cursor drifted), so the latched click still opens its link
+        // rather than being swallowed by the report-suppression below — but
+        // only when the click started on a link. A latched ctrl/super drag that
+        // began *off* a link does not open a link it merely released over (its
+        // press was already withheld from the program); that click is swallowed.
+        const armed_off_link = self.mouse.link_click_active and
+            !self.mouse.link_press_over_link;
+        if ((self.mouse.over_link or self.mouse.link_click_active) and
+            !armed_off_link)
+        {
             const pos = try self.rt_surface.getCursorPos();
             self.renderer_state.mutex.lock();
             defer self.renderer_state.mutex.unlock();
@@ -4050,6 +4122,22 @@ pub fn mouseButtonCallback(
             // If we have shift-pressed and we aren't allowed to capture it,
             // then we do not do a mouse report.
             if (mods.shift and !shift_capture) break :report;
+
+            // A left click that activates a link (ctrl/super chord held at
+            // press; latched in self.mouse.link_click_active) belongs to the
+            // terminal (link activation / smart-select), not the program — the
+            // release opens the link locally (see mouseLinkRefreshAllowed /
+            // processLinks). Suppress the entire click, press *and* release,
+            // from the program. Latching at press and holding through release
+            // — instead of re-checking the live modifier here — keeps a
+            // mid-click modifier release (or a cursor drift off the link cell)
+            // from leaking a half-click to mouse-grabbing alt-screen TUIs like
+            // Claude Code and Codex. Scoped to the left button because link
+            // activation is only attempted on left-button release, so ctrl/super
+            // right/middle clicks still reach the program. Matches iTerm2 / macOS
+            // Terminal, where the link modifier is reserved for the terminal.
+            // Fixes manaflow-ai/cmux#5128.
+            if (button == .left and self.mouse.link_click_active) break :report;
 
             // In any other mouse button scenario without shift pressed we
             // clear the selection since the underlying application can handle
@@ -4476,8 +4564,16 @@ fn linkAtPos(
         break :mouse_pin pin;
     };
 
-    // Get our comparison mods
-    const mouse_mods = self.mouseModsWithCapture(self.mouse.mods);
+    // Get our comparison mods. When a left link-click is in flight (the
+    // ctrl/super link chord was held at press; see mouseButtonCallback), use
+    // that chord even if the modifier was released before the button came up,
+    // so the latched click still resolves and opens its link instead of being
+    // swallowed. Outside an active link click this is just the live mods.
+    const effective_mods = if (self.mouse.link_click_active)
+        input.ctrlOrSuper(.{})
+    else
+        self.mouse.mods;
+    const mouse_mods = self.mouseModsWithCapture(effective_mods);
 
     // If we have the proper modifiers set then we can check for OSC8 links.
     if (mouse_mods.equal(input.ctrlOrSuper(.{}))) hyperlink: {
@@ -4780,14 +4876,16 @@ pub fn cursorPosCallback(
     // 2. the cursor position has changed (either we have no previous state, or the state has
     //    changed)
     // AND
-    // 1. mouse reporting is off
-    // OR
-    // 2. mouse reporting is on and we are not reporting shift to the terminal
+    // local link handling is allowed for the current mouse-reporting state
+    // and mods (see mouseLinkRefreshAllowed) — OR we were over a link, so we
+    // can clear a stale highlight/cursor when the ctrl/super chord is released
+    // via this path (some platforms deliver modifier changes through
+    // cursorPosCallback's mods rather than a separate key callback). Refreshing
+    // with the chord dropped finds no link and resets the hover state.
     if ((over_link or
         self.mouse.link_point == null or
         (self.mouse.link_point != null and !self.mouse.link_point.?.eql(pos_vp))) and
-        (self.io.terminal.flags.mouse_event == .none or
-            (self.mouse.mods.shift and !self.mouseShiftCapture(false))))
+        (self.mouseLinkRefreshAllowed() or over_link))
     {
         // If we were previously over a link, we always update. We do this so that if the text
         // changed underneath us, even if the mouse didn't move, we update the URL hints and state
@@ -4803,6 +4901,18 @@ pub fn cursorPosCallback(
             for (self.mouse.click_state) |state| {
                 if (state != .release) break :report;
             }
+        }
+
+        // A link-activation left click (latched in self.mouse.link_click_active
+        // at press; see mouseButtonCallback) reserves the whole click+drag for
+        // the terminal, so motion during that drag must not leak button-motion
+        // reports to a mouse-grabbing program either. Gate on the left button
+        // still being pressed so pure movement reports and other-button drags
+        // are unaffected. Part of manaflow-ai/cmux#5128.
+        if (self.mouse.link_click_active and
+            self.mouse.click_state[@intFromEnum(input.MouseButton.left)] == .press)
+        {
+            break :report;
         }
 
         // We use the first mouse button we find pressed in order to report
@@ -6648,6 +6758,39 @@ fn testMouseSelectionIsNull(
 /// not available on a particular platform.
 pub fn getProcessInfo(self: *Surface, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
     return self.io.getProcessInfo(info);
+}
+
+test "Surface: mouseLinkRefreshAllowedState honors ctrl/super under mouse reporting" {
+    const ctrl_or_super = input.ctrlOrSuper(.{});
+
+    // Mouse reporting off: links are always evaluated, regardless of mods.
+    try std.testing.expect(mouseLinkRefreshAllowedState(false, false, .{}));
+    try std.testing.expect(mouseLinkRefreshAllowedState(false, false, ctrl_or_super));
+
+    // Mouse reporting on, no relevant mods: the event is reported to the app,
+    // links are not evaluated locally.
+    try std.testing.expect(!mouseLinkRefreshAllowedState(true, false, .{}));
+
+    // Mouse reporting on, ctrl/super link modifier held: links are evaluated
+    // so Cmd-click (macOS) / Ctrl-click opens a link even while a
+    // fullscreen/alternate-screen TUI has grabbed the mouse. This is the
+    // behavior that was missing in cmux issue #5128.
+    try std.testing.expect(mouseLinkRefreshAllowedState(true, false, ctrl_or_super));
+
+    // Same as above but with shift-capture enabled: the ctrl/super link path
+    // must not be gated on shift_capture, since shift is not part of the chord.
+    try std.testing.expect(mouseLinkRefreshAllowedState(true, true, ctrl_or_super));
+
+    // Mouse reporting on, shift held and shift-capture disallowed: evaluated
+    // (pre-existing shift-release-from-capture behavior, unchanged).
+    try std.testing.expect(mouseLinkRefreshAllowedState(true, false, .{ .shift = true }));
+
+    // Mouse reporting on, shift held but shift-capture allowed: reported.
+    try std.testing.expect(!mouseLinkRefreshAllowedState(true, true, .{ .shift = true }));
+
+    // Mouse reporting on, ctrl/super plus a non-shift modifier: not an exact
+    // link-activation chord, so the event is reported to the app.
+    try std.testing.expect(!mouseLinkRefreshAllowedState(true, false, input.ctrlOrSuper(.{ .alt = true })));
 }
 
 test "Surface: selection logic" {
