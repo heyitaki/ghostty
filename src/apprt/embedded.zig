@@ -79,6 +79,15 @@ pub const App = struct {
 
         /// Close the current surface given by this function.
         close_surface: ?*const fn (SurfaceUD, bool) callconv(.c) void = null,
+
+        /// Report read-only tmux control-mode state for the surface.
+        tmux_control: ?*const fn (
+            SurfaceUD,
+            apprt.surface.Message.TmuxControlMsg.Event,
+            u32,
+            [*]const u8,
+            usize,
+        ) callconv(.c) void = null,
     };
 
     /// This is the key event sent for ghostty_surface_key and
@@ -275,23 +284,11 @@ pub const App = struct {
         // embedded apprt.
         self.performPreAction(target, action, value);
 
-        switch (action) {
-            .tmux_control => log.debug(
-                "dispatching action target={t} action={} event={s} id={} data_len={}",
-                .{
-                    target,
-                    action,
-                    @tagName(value.event),
-                    value.id,
-                    value.data.len,
-                },
-            ),
-            else => log.debug("dispatching action target={t} action={} value={any}", .{
-                target,
-                action,
-                value,
-            }),
-        }
+        log.debug("dispatching action target={t} action={} value={any}", .{
+            target,
+            action,
+            value,
+        });
         return self.opts.action(
             self,
             target.cval(),
@@ -684,6 +681,16 @@ pub const Surface = struct {
         };
 
         func(self.userdata, process_alive);
+    }
+
+    pub fn tmuxControl(
+        self: *const Surface,
+        event: apprt.surface.Message.TmuxControlMsg.Event,
+        id: u32,
+        data: []const u8,
+    ) void {
+        const func = self.app.opts.tmux_control orelse return;
+        func(self.userdata, event, id, data.ptr, data.len);
     }
 
     pub fn getContentScale(self: *const Surface) !apprt.ContentScale {
@@ -2810,6 +2817,35 @@ pub const CAPI = struct {
                 .{ .forever = {} },
             );
             surface.renderer_thread.wakeup.notify() catch {};
+        }
+
+        /// cmux fork: release (realized=false) or recreate (realized=true) the
+        /// renderer's GPU resources (Metal swap chain / IOSurface) for a surface
+        /// without freeing the surface itself. Lets cmux reclaim the ~40MB
+        /// IOSurface of an occluded terminal while keeping its PTY/io thread and
+        /// terminal state alive; the swap chain is rebuilt on re-show.
+        ///
+        /// Darwin-only by placement: iOS owns occlusion via `renderingSuspended`
+        /// and must not be driven through this path. The message is
+        /// non-idempotent (it must strictly alternate with the swap chain's
+        /// `defunct` state), so the caller (cmux) must only advance its own
+        /// realize/unrealize state when this returns `true`. The push is
+        /// `.instant` (non-blocking): this runs on the caller's main actor and
+        /// must never stall the UI waiting on the renderer thread to drain. When
+        /// the mailbox is full the push drops and returns `false`; cmux keeps its
+        /// mirror state unchanged and retries on its next reclamation pass, so a
+        /// drop is harmless rather than tripping `displayRealized`'s
+        /// `assert(swap_chain.defunct)`. On re-show the mailbox is normally empty,
+        /// so the realize enqueues immediately and the surface is never presented
+        /// against a defunct swap chain.
+        export fn ghostty_surface_set_renderer_realized(ptr: *Surface, realized: bool) bool {
+            const surface = &ptr.core_surface;
+            const enqueued = surface.renderer_thread.mailbox.push(
+                .{ .display_realized = realized },
+                .{ .instant = {} },
+            ) != 0;
+            surface.renderer_thread.wakeup.notify() catch {};
+            return enqueued;
         }
 
         /// This returns a CTFontRef that should be used for quicklook
