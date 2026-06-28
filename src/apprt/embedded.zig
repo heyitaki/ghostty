@@ -79,6 +79,15 @@ pub const App = struct {
 
         /// Close the current surface given by this function.
         close_surface: ?*const fn (SurfaceUD, bool) callconv(.c) void = null,
+
+        /// Report read-only tmux control-mode state for the surface.
+        tmux_control: ?*const fn (
+            SurfaceUD,
+            apprt.surface.Message.TmuxControlMsg.Event,
+            u32,
+            [*]const u8,
+            usize,
+        ) callconv(.c) void = null,
     };
 
     /// This is the key event sent for ghostty_surface_key and
@@ -275,23 +284,11 @@ pub const App = struct {
         // embedded apprt.
         self.performPreAction(target, action, value);
 
-        switch (action) {
-            .tmux_control => log.debug(
-                "dispatching action target={t} action={} event={s} id={} data_len={}",
-                .{
-                    target,
-                    action,
-                    @tagName(value.event),
-                    value.id,
-                    value.data.len,
-                },
-            ),
-            else => log.debug("dispatching action target={t} action={} value={any}", .{
-                target,
-                action,
-                value,
-            }),
-        }
+        log.debug("dispatching action target={t} action={} value={any}", .{
+            target,
+            action,
+            value,
+        });
         return self.opts.action(
             self,
             target.cval(),
@@ -684,6 +681,16 @@ pub const Surface = struct {
         };
 
         func(self.userdata, process_alive);
+    }
+
+    pub fn tmuxControl(
+        self: *const Surface,
+        event: apprt.surface.Message.TmuxControlMsg.Event,
+        id: u32,
+        data: []const u8,
+    ) void {
+        const func = self.app.opts.tmux_control orelse return;
+        func(self.userdata, event, id, data.ptr, data.len);
     }
 
     pub fn getContentScale(self: *const Surface) !apprt.ContentScale {
@@ -1697,6 +1704,29 @@ pub const CAPI = struct {
         };
     }
 
+    /// Select inclusive absolute screen rows without writing clipboards
+    /// (cmux-specific).
+    export fn ghostty_surface_select_screen_rows(
+        surface: *Surface,
+        top_y: u32,
+        bottom_y: u32,
+    ) bool {
+        return surface.core_surface.selectScreenRows(top_y, bottom_y) catch |err| {
+            log.warn("error selecting screen rows err={}", .{err});
+            return false;
+        };
+    }
+
+    /// Query the active tracked selection as inclusive absolute screen rows
+    /// (cmux-specific).
+    export fn ghostty_surface_selection_screen_rows(
+        surface: *Surface,
+        top_y: *u32,
+        bottom_y: *u32,
+    ) bool {
+        return surface.core_surface.selectionScreenRows(top_y, bottom_y);
+    }
+
     /// Same as ghostty_surface_read_text but reads from the user selection,
     /// if any.
     export fn ghostty_surface_read_selection(
@@ -1734,6 +1764,35 @@ pub const CAPI = struct {
         return readTextLocked(surface, core_sel, result);
     }
 
+    /// cmux fork: read clipboard-formatted plain text from inclusive absolute
+    /// screen rows without mutating the active selection.
+    export fn ghostty_surface_read_screen_clipboard_text(
+        surface: *Surface,
+        top_y: u32,
+        bottom_y: u32,
+        max_bytes: usize,
+        result: *Text,
+    ) bool {
+        surface.core_surface.renderer_state.mutex.lock();
+        defer surface.core_surface.renderer_state.mutex.unlock();
+
+        if (top_y > bottom_y) return false;
+
+        const screen = surface.core_surface.renderer_state.terminal.screens.active;
+        const pages = &screen.pages;
+        if (pages.cols == 0) return false;
+
+        const top_left = pages.pin(.{
+            .screen = .{ .x = 0, .y = top_y },
+        }) orelse return false;
+        const bottom_right = pages.pin(.{
+            .screen = .{ .x = pages.cols -| 1, .y = bottom_y },
+        }) orelse return false;
+        const core_sel = terminal.Selection.init(top_left, bottom_right, false);
+
+        return readClipboardTextLocked(surface, core_sel, max_bytes, result);
+    }
+
     fn readTextLocked(
         surface: *Surface,
         core_sel: terminal.Selection,
@@ -1764,6 +1823,57 @@ pub const CAPI = struct {
             .offset_len = vp.offset_len,
             .text = text.text.ptr,
             .text_len = text.text.len,
+        };
+
+        return true;
+    }
+
+    fn readClipboardTextLocked(
+        surface: *Surface,
+        core_sel: terminal.Selection,
+        max_bytes: usize,
+        result: *Text,
+    ) bool {
+        const core_surface = &surface.core_surface;
+        const opts: terminal.formatter.Options = .{
+            .emit = .plain,
+            .unwrap = true,
+            .trim = core_surface.config.clipboard_trim_trailing_spaces,
+            .codepoint_map = core_surface.config.clipboard_codepoint_map.map.list,
+            .background = core_surface.io.terminal.colors.background.get(),
+            .foreground = core_surface.io.terminal.colors.foreground.get(),
+            .palette = &core_surface.io.terminal.colors.palette.current,
+        };
+
+        var formatter: terminal.formatter.ScreenFormatter = .init(
+            core_surface.io.terminal.screens.active,
+            opts,
+        );
+        formatter.content = .{ .selection = core_sel };
+
+        const scratch = global.alloc.alloc(u8, max_bytes) catch |err| {
+            log.warn("error allocating bounded clipboard text buffer err={}", .{err});
+            return false;
+        };
+        defer global.alloc.free(scratch);
+
+        var writer = std.Io.Writer.fixed(scratch);
+        formatter.format(&writer) catch |err| {
+            log.warn("error formatting clipboard text err={}", .{err});
+            return false;
+        };
+        const formatted = global.alloc.dupeZ(u8, writer.buffered()) catch |err| {
+            log.warn("error allocating clipboard text err={}", .{err});
+            return false;
+        };
+
+        result.* = .{
+            .tl_px_x = -1,
+            .tl_px_y = -1,
+            .offset_start = 0,
+            .offset_len = 0,
+            .text = formatted.ptr,
+            .text_len = formatted.len,
         };
 
         return true;
@@ -2810,6 +2920,35 @@ pub const CAPI = struct {
                 .{ .forever = {} },
             );
             surface.renderer_thread.wakeup.notify() catch {};
+        }
+
+        /// cmux fork: release (realized=false) or recreate (realized=true) the
+        /// renderer's GPU resources (Metal swap chain / IOSurface) for a surface
+        /// without freeing the surface itself. Lets cmux reclaim the ~40MB
+        /// IOSurface of an occluded terminal while keeping its PTY/io thread and
+        /// terminal state alive; the swap chain is rebuilt on re-show.
+        ///
+        /// Darwin-only by placement: iOS owns occlusion via `renderingSuspended`
+        /// and must not be driven through this path. The message is
+        /// non-idempotent (it must strictly alternate with the swap chain's
+        /// `defunct` state), so the caller (cmux) must only advance its own
+        /// realize/unrealize state when this returns `true`. The push is
+        /// `.instant` (non-blocking): this runs on the caller's main actor and
+        /// must never stall the UI waiting on the renderer thread to drain. When
+        /// the mailbox is full the push drops and returns `false`; cmux keeps its
+        /// mirror state unchanged and retries on its next reclamation pass, so a
+        /// drop is harmless rather than tripping `displayRealized`'s
+        /// `assert(swap_chain.defunct)`. On re-show the mailbox is normally empty,
+        /// so the realize enqueues immediately and the surface is never presented
+        /// against a defunct swap chain.
+        export fn ghostty_surface_set_renderer_realized(ptr: *Surface, realized: bool) bool {
+            const surface = &ptr.core_surface;
+            const enqueued = surface.renderer_thread.mailbox.push(
+                .{ .display_realized = realized },
+                .{ .instant = {} },
+            ) != 0;
+            surface.renderer_thread.wakeup.notify() catch {};
+            return enqueued;
         }
 
         /// This returns a CTFontRef that should be used for quicklook
