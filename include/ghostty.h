@@ -886,21 +886,13 @@ typedef struct {
   ssize_t selected;
 } ghostty_action_search_selected_s;
 
-// apprt.action.TmuxControl.Event
+// apprt.surface.Message.TmuxControlMsg.Event
 typedef enum {
   GHOSTTY_TMUX_ENTER,
   GHOSTTY_TMUX_EXIT,
   GHOSTTY_TMUX_WINDOWS_CHANGED,
   GHOSTTY_TMUX_PANE_OUTPUT,
 } ghostty_tmux_event_e;
-
-// apprt.action.TmuxControl
-typedef struct {
-  ghostty_tmux_event_e event;
-  uint32_t id;
-  const uint8_t *data;
-  uintptr_t data_len;
-} ghostty_action_tmux_control_s;
 
 // terminal.Scrollbar
 typedef struct {
@@ -976,7 +968,6 @@ typedef enum {
   GHOSTTY_ACTION_SEARCH_SELECTED,
   GHOSTTY_ACTION_READONLY,
   GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD,
-  GHOSTTY_ACTION_TMUX_CONTROL,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -1018,7 +1009,6 @@ typedef union {
   ghostty_action_search_total_s search_total;
   ghostty_action_search_selected_s search_selected;
   ghostty_action_readonly_e readonly;
-  ghostty_action_tmux_control_s tmux_control;
 } ghostty_action_u;
 
 typedef struct {
@@ -1044,6 +1034,11 @@ typedef void (*ghostty_runtime_close_surface_cb)(void*, bool);
 typedef bool (*ghostty_runtime_action_cb)(ghostty_app_t,
                                           ghostty_target_s,
                                           ghostty_action_s);
+typedef void (*ghostty_runtime_tmux_control_cb)(void*,
+                                                ghostty_tmux_event_e,
+                                                uint32_t,
+                                                const uint8_t*,
+                                                uintptr_t);
 
 typedef struct {
   void* userdata;
@@ -1054,6 +1049,7 @@ typedef struct {
   ghostty_runtime_confirm_read_clipboard_cb confirm_read_clipboard_cb;
   ghostty_runtime_write_clipboard_cb write_clipboard_cb;
   ghostty_runtime_close_surface_cb close_surface_cb;
+  ghostty_runtime_tmux_control_cb tmux_control_cb;
 } ghostty_runtime_config_s;
 
 // apprt.ipc.Target.Key
@@ -1220,14 +1216,32 @@ GHOSTTY_API bool ghostty_surface_has_selection(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_select_cursor_cell(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_select_cursor_line(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_clear_selection(ghostty_surface_t);
+// cmux fork: set/query the active selection from inclusive absolute screen rows.
+// The setter updates Ghostty's tracked selection pins without writing clipboards.
+GHOSTTY_API bool ghostty_surface_select_screen_rows(ghostty_surface_t,
+                                                    uint32_t,
+                                                    uint32_t);
+GHOSTTY_API bool ghostty_surface_selection_screen_rows(ghostty_surface_t,
+                                                       uint32_t*,
+                                                       uint32_t*);
 GHOSTTY_API bool ghostty_surface_read_selection(ghostty_surface_t, ghostty_text_s*);
 GHOSTTY_API bool ghostty_surface_read_text(ghostty_surface_t,
                                               ghostty_selection_s,
                                               ghostty_text_s*);
+// cmux fork: read clipboard-formatted plain text from inclusive absolute screen
+// rows without mutating the active selection. This preserves clipboard trimming
+// and codepoint-map settings for off-viewport copy-mode fallback copies.
+// Formatting stops before allocating more than max_bytes of output.
+GHOSTTY_API bool ghostty_surface_read_screen_clipboard_text(ghostty_surface_t,
+                                                            uint32_t,
+                                                            uint32_t,
+                                                            uintptr_t,
+                                                            ghostty_text_s*);
 GHOSTTY_API void ghostty_surface_free_text(ghostty_surface_t, ghostty_text_s*);
 
 #ifdef __APPLE__
 GHOSTTY_API void ghostty_surface_set_display_id(ghostty_surface_t, uint32_t);
+GHOSTTY_API bool ghostty_surface_set_renderer_realized(ghostty_surface_t, bool);
 GHOSTTY_API void* ghostty_surface_quicklook_font(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_quicklook_word(ghostty_surface_t, ghostty_text_s*);
 #endif
